@@ -63,6 +63,13 @@ to the tick's own simulated `now` (not the server clock — this matters for
 determinism), or if the merchant has 3+ consecutive unanswered Vera
 messages (back off rather than spam).
 
+After resolving valid triggers, the tick also **dedupes to one trigger per
+merchant per tick** — keeping only the highest-urgency trigger per merchant
+and dropping the rest. The brief is explicit that strong bots "choose the
+one signal that should drive the next message" rather than acting on every
+available fact; sending a merchant two separate messages in the same tick
+is that same failure mode at the message level.
+
 ## Staying inside the judge's 30s / 20-actions-per-tick budget
 A single `/v1/tick` call can carry up to 20 triggers, and the whole tick has
 a hard 30-second timeout — but a real LLM call (especially against a
@@ -71,12 +78,13 @@ calls can blow both the time budget and, on constrained providers, the
 token-per-minute budget. `bot.py` handles this with three techniques rather
 than assuming unlimited LLM headroom:
 
-1. **Deadline tracking** — the tick sets an internal ~24s deadline (leaving
-   margin under the judge's 30s limit for network/serialization overhead).
-   Before each trigger, it checks how much budget is left; once there isn't
-   enough left for even one more safe LLM call, remaining triggers go
-   straight to the deterministic rule-based composer instead of risking a
-   timeout on the whole tick.
+1. **Deadline tracking** — the tick sets an internal ~25s deadline (override
+   with `TICK_BUDGET_SECONDS`), leaving margin under the judge's 30s limit
+   for network/serialization overhead. Before each trigger, it checks how
+   much budget is left; once there isn't enough left for even one more safe
+   LLM call, remaining triggers go straight to the deterministic rule-based
+   composer instead of risking a timeout on the whole tick. A hard cap of 20
+   actions per tick is also enforced, per the challenge contract.
 2. **Urgency-first ordering** — triggers are processed by descending
    `urgency` (from the trigger's own payload) rather than in arbitrary
    order, so if the LLM budget runs out partway through a large tick, it's
