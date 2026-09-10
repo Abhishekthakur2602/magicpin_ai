@@ -213,6 +213,12 @@ Hard rules:
   Every number, date, or named entity in your message must be traceable to a \
   specific field in CATEGORY, MERCHANT, TRIGGER, or CUSTOMER — if you can't \
   point to where a fact came from, cut it or rephrase it qualitatively.
+- Any raw JSON field ending in "_pct" or named "delta"/"delta_pct" is a \
+  FRACTION, not an already-formatted percentage: -0.3 means "30%" (down), \
+  0.14 means "14%" (up) — always multiply by 100. If the REFERENCE FACTS \
+  block already states a formatted percentage (e.g. "30%"), that number is \
+  correct — use it as-is rather than recomputing your own from the raw \
+  field, and never state a percentage that contradicts it.
 - No promotional hype ("AMAZING DEAL!"), no multiple CTAs, no buried CTA \
   (the ask should land in the last sentence), no long preambles.
 - Use one or more engagement levers: specificity, loss aversion, social \
