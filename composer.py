@@ -1074,9 +1074,44 @@ def _is_repeat(body: str, merchant: dict) -> bool:
     return False
 
 
+def _collect_fraction_pcts(d: dict, out: list) -> None:
+    if not isinstance(d, dict):
+        return
+    for k, v in d.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and \
+           (k == "delta_pct" or k.endswith("_pct")) and -1 <= v <= 1 and v != 0:
+            out.append(v)
+        elif isinstance(v, dict):
+            _collect_fraction_pcts(v, out)
+
+
+def _fix_pct_scaling(body: str, trigger: dict, merchant: dict) -> str:
+    """LLM providers (especially weaker free-tier models) sometimes read a
+    raw fraction field like delta_pct: -0.3 and print it as "0.3%" instead
+    of converting to "30%" — a real factual error, not just a style issue
+    (caught live: a -30% call dip got reported as a -0.3% dip). Since the
+    correct value is always deterministically computable from context,
+    detect and correct this mis-scaling rather than relying on prompt
+    instructions alone, which a weaker model may not reliably follow."""
+    fractions: list = []
+    _collect_fraction_pcts(trigger.get("payload", {}) or {}, fractions)
+    _collect_fraction_pcts(g(merchant, "performance", "delta_7d", default={}) or {}, fractions)
+    for x in fractions:
+        correct = f"{abs(x) * 100:.0f}%"
+        wrong_candidates = {
+            f"{abs(x):.1f}%", f"{abs(x):.2f}%", f"{abs(x)}%",
+            f"-{abs(x):.1f}%", f"{x:.1f}%", f"{x}%",
+        }
+        for wrong in wrong_candidates:
+            if wrong != correct and wrong in body:
+                body = body.replace(wrong, correct)
+    return body
+
+
 def validate_and_repair(candidate: dict, category: dict, merchant: dict,
                          trigger: dict, customer: dict | None) -> dict:
     body = str(candidate.get("body", "")).strip()
+    body = _fix_pct_scaling(body, trigger, merchant)
     cta = candidate.get("cta", "open_ended")
     send_as = candidate.get("send_as", "merchant_on_behalf" if customer else "vera")
     rationale = candidate.get("rationale", "Composed from category, merchant, and trigger context.")
