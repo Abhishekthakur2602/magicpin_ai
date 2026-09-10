@@ -15,6 +15,25 @@ rule-based fallback in composer.py):
     LLM_PROVIDER = anthropic | openai | gemini | deepseek | none
     LLM_API_KEY  = <key>
     LLM_MODEL    = <override>
+
+CHANGELOG (this revision):
+  - /v1/tick now dedupes resolved triggers per merchant_id, keeping only the
+    single highest-urgency trigger per merchant per tick. The brief is
+    explicit that "strong bots ... choose the one signal that should drive
+    the next message" — sending two separate messages to the same merchant
+    in one tick is the message-level version of the same mistake, even if
+    each individual message is otherwise fine.
+  - Added an opt-in, env-gated /v1/_dev/reset endpoint purely for local
+    testing convenience: SENT_SUPPRESSION_KEYS and CONTEXT_STORE are
+    in-memory and persist for the life of the uvicorn process, so running
+    judge_simulator.py multiple times against an already-running bot without
+    restarting it will show fewer and fewer actions each run (previously-
+    sent suppression keys carry over) — this looks like a regression but is
+    actually correct anti-spam behavior applied across what should have been
+    independent test runs. Restarting the process (or hitting this endpoint
+    when enabled) gives a clean slate for local dev. Disabled by default;
+    enable with VERA_DEV_RESET=1. The real harness runs one continuous
+    session, so this is never needed there.
 """
 
 from __future__ import annotations
@@ -122,21 +141,25 @@ def post_context(req: ContextPush):
 def post_tick(req: TickRequest):
     actions = []
 
-    # The brief documents a 30s harness timeout, but some test clients
-    # (including the bundled judge_simulator.py, whose BotClient.tick()
-    # hardcodes a 15s read timeout) are stricter than that. Default to a
-    # budget that comfortably fits under the tighter 15s case, with room
-    # to override via env var if you confirm the real harness allows more.
-    tick_budget_s = float(os.environ.get("TICK_BUDGET_SECONDS", "11.0"))
+    # judge_simulator.py's BotClient.tick() opens a 30s request timeout
+    # (see `self._request("POST", "/v1/tick", 30, ...)`), and the challenge
+    # brief documents the same 30s harness timeout. Budget close to that,
+    # leaving a safety margin for building/serializing the response and the
+    # network round-trip — not an overly-conservative cap that would starve
+    # later (still-urgent) triggers in a batch into the weaker rule-based
+    # fallback path unnecessarily. Override via env var if your real
+    # harness's timeout differs.
+    tick_budget_s = float(os.environ.get("TICK_BUDGET_SECONDS", "25.0"))
     TICK_DEADLINE = time.monotonic() + tick_budget_s
     MIN_BUDGET_FOR_LLM_CALL = 3.0  # don't start an LLM call with less runway than this
+    MAX_ACTIONS_PER_TICK = 20      # hard cap per the challenge contract ("20 actions/tick")
 
     # Resolve all valid (trigger, merchant, category, customer) tuples first,
     # then process highest-urgency triggers first — if we run out of time
-    # budget partway through, the triggers that matter most for decision
-    # quality have already gotten the (slower, better) LLM path, and the
-    # rest gracefully degrade to the rule-based composer instead of the
-    # tick failing outright.
+    # budget or hit the action cap partway through, the triggers that
+    # matter most for decision quality have already gotten the (slower,
+    # better) LLM path, and the rest simply aren't actioned this tick
+    # instead of the tick failing outright.
     resolved = []
     for trigger_id in req.available_triggers:
         trigger = get_context("trigger", trigger_id)
@@ -157,7 +180,29 @@ def post_tick(req: TickRequest):
 
     resolved.sort(key=lambda t: t[1].get("urgency", 0), reverse=True)
 
+    # Dedupe to one trigger per merchant per tick: after sorting by urgency,
+    # keep only the first (highest-urgency) trigger we see for each
+    # merchant_id and drop the rest. Without this, two independently-firing
+    # triggers for the same merchant in one batch each produce their own
+    # "send" action — i.e. the merchant gets two separate WhatsApp messages
+    # in the same tick. The brief is explicit that strong bots "choose the
+    # one signal that should drive the next message" rather than acting on
+    # every available fact; sending twice in one tick is that same failure
+    # mode at the message level, not just within a single message's body.
+    seen_merchants: set[str] = set()
+    deduped = []
+    for item in resolved:
+        merchant_id = item[2].get("merchant_id")
+        if merchant_id in seen_merchants:
+            continue
+        seen_merchants.add(merchant_id)
+        deduped.append(item)
+    resolved = deduped
+
     for trigger_id, trigger, merchant, category, customer in resolved:
+        if len(actions) >= MAX_ACTIONS_PER_TICK:
+            break  # contract cap: never return more than 20 actions/tick
+
         remaining = TICK_DEADLINE - time.monotonic()
         allow_llm = remaining > MIN_BUDGET_FOR_LLM_CALL
         # bound the network call itself to what's actually left, minus a
@@ -294,3 +339,22 @@ def metadata():
         "endpoints": ["/v1/context", "/v1/tick", "/v1/reply", "/v1/healthz", "/v1/metadata"],
         "deterministic": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# dev-only reset endpoint (disabled unless VERA_DEV_RESET=1)
+# ---------------------------------------------------------------------------
+# Purely a local-testing convenience: running judge_simulator.py repeatedly
+# against a still-live bot process accumulates SENT_SUPPRESSION_KEYS across
+# runs, since it's an in-memory set that only clears on process restart. The
+# real harness runs one continuous session and never needs this — never
+# enable VERA_DEV_RESET in anything resembling the graded deployment.
+
+if os.environ.get("VERA_DEV_RESET") == "1":
+    @app.post("/v1/_dev/reset")
+    def dev_reset():
+        CONTEXT_STORE.clear()
+        SENT_SUPPRESSION_KEYS.clear()
+        CONVERSATIONS.clear()
+        return {"reset": True}
+    
